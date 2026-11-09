@@ -12,19 +12,12 @@ const VIDEO_URL = process.env.LINK_VIDEO_TEST_URL || "";
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122 Safari/537.36";
 const QUALITY = {
-  "3": {
-    ceiling: 1080,
-    selector: "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
-  },
-  "2": {
-    ceiling: 720,
-    selector: "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
-  },
-  "1": {
-    ceiling: 480,
-    selector: "bestvideo[height<=480]+bestaudio/best[height<=480]/best",
-  },
+  "3": { ceiling: 1080, crf: 22, audioBitrate: "128k" },
+  "2": { ceiling: 720, crf: 27, audioBitrate: "96k" },
+  "1": { ceiling: 480, crf: 31, audioBitrate: "80k" },
 };
+let infoPromise;
+let mediaUrlPromise;
 
 function validateInput() {
   assert.ok(VIDEO_URL, "Set LINK_VIDEO_TEST_URL to the user-provided video page.");
@@ -117,6 +110,32 @@ function runCurl(args, timeout = 30_000) {
   });
 }
 
+function runCommand(command, args, timeout = 180_000) {
+  return new Promise((resolveRun, rejectRun) => {
+    const child = spawn(command, args, {
+      cwd: ROOT,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    let stdout = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      rejectRun(new Error(`${command} timed out`));
+    }, timeout);
+    child.stdout.setEncoding("utf8").on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.once("error", () => {
+      clearTimeout(timer);
+      rejectRun(new Error(`${command} could not start`));
+    });
+    child.once("close", (code, signal) => {
+      clearTimeout(timer);
+      if (code === 0) return resolveRun(stdout.trim());
+      rejectRun(new Error(`${command} exited with ${code ?? signal ?? "unknown status"}`));
+    });
+  });
+}
+
 function parseJson(stdout) {
   for (const line of stdout.split(/\r?\n/).reverse()) {
     const candidate = line.trim();
@@ -128,8 +147,25 @@ function parseJson(stdout) {
   throw new Error("yt-dlp did not return JSON metadata");
 }
 
-function selectedFormats(info) {
-  return info.requested_formats?.length ? info.requested_formats : [info];
+function extractInfo() {
+  if (!infoPromise) {
+    infoPromise = runYtDlp(["--simulate", "--dump-single-json"])
+      .then(({ stdout }) => parseJson(stdout));
+  }
+  return infoPromise;
+}
+
+function extractMediaUrl() {
+  if (!mediaUrlPromise) {
+    mediaUrlPromise = extractInfo().then((info) => {
+      const mediaUrl = info.formats?.find((format) => format.url)?.url;
+      assert.ok(mediaUrl, "The extractor did not return a media URL.");
+      const parsed = new URL(mediaUrl);
+      assert.ok(["https:", "http:"].includes(parsed.protocol));
+      return mediaUrl;
+    });
+  }
+  return mediaUrlPromise;
 }
 
 function summarize(info) {
@@ -157,9 +193,7 @@ function summarize(info) {
 validateInput();
 
 test("extracts metadata and available formats from the page", async () => {
-  const info = parseJson(
-    (await runYtDlp(["--simulate", "--dump-single-json"])).stdout,
-  );
+  const info = await extractInfo();
   assert.ok(Array.isArray(info.formats) && info.formats.length > 0);
   console.log(`VIDEO_TEST_METADATA ${JSON.stringify(summarize(info))}`);
 });
@@ -190,11 +224,7 @@ test("the public page responds without downloading media", async () => {
 });
 
 test("the media endpoint accepts a small range request", async () => {
-  const info = parseJson(
-    (await runYtDlp(["--simulate", "--dump-single-json"])).stdout,
-  );
-  const mediaUrl = info.formats?.find((format) => format.url)?.url;
-  assert.ok(mediaUrl, "The extractor did not return a media URL.");
+  const mediaUrl = await extractMediaUrl();
   const media = new URL(mediaUrl);
   assert.ok(["https:", "http:"].includes(media.protocol));
   const raw = await runCurl([
@@ -231,57 +261,124 @@ test("the media endpoint accepts a small range request", async () => {
   );
 });
 
-for (const [quality, profile] of Object.entries(QUALITY)) {
-  test(`quality ${quality} selects video no higher than ${profile.ceiling}p`, async () => {
-    const info = parseJson(
-      (
-        await runYtDlp([
-          "--simulate",
-          "--dump-single-json",
-          "--format",
-          profile.selector,
-        ])
-      ).stdout,
-    );
-    const formats = selectedFormats(info);
-    const heights = formats
-      .map((format) => format.height)
-      .filter((height) => Number.isFinite(height));
-    assert.ok(formats.length > 0, "No format was selected.");
-    assert.ok(heights.length > 0, "The selected video format has no known height.");
-    assert.ok(heights.every((height) => height <= profile.ceiling));
-    assert.ok(
-      formats.some((format) => format.vcodec && format.vcodec !== "none"),
-      "The selected format has no video stream.",
-    );
-    console.log(`VIDEO_TEST_QUALITY ${quality} ${Math.max(...heights)}p`);
-  });
-}
-
-test("downloads a high-quality sample within WhatsApp's current size cap", async () => {
+test("downloads the direct MP4 and builds all three sendable quality profiles", async () => {
   const outputDir = await mkdtemp(join(tmpdir(), "video-link-test-"));
-  const outputTemplate = join(outputDir, "sample.%(ext)s");
+  const sourcePath = join(outputDir, "source.mp4");
+  const maxBytes = 50 * 1024 * 1024;
   try {
-    await runYtDlp(
+    const mediaUrl = await extractMediaUrl();
+    await runCurl(
       [
-        "--format",
-        QUALITY["3"].selector,
+        "--silent",
+        "--show-error",
+        "--fail",
+        "--location",
+        "--max-time",
+        "240",
         "--max-filesize",
-        "50M",
-        "--merge-output-format",
-        "mp4",
+        String(100 * 1024 * 1024),
+        "--user-agent",
+        USER_AGENT,
+        "--referer",
+        VIDEO_URL,
         "--output",
-        outputTemplate,
+        sourcePath,
+        mediaUrl,
       ],
-      300_000,
+      250_000,
     );
-    const files = await readdir(outputDir);
-    assert.equal(files.length, 1, "Expected exactly one downloaded media file.");
-    const media = await stat(join(outputDir, files[0]));
-    assert.ok(media.size > 5_000, "Downloaded media file is unexpectedly small.");
-    assert.ok(media.size <= 55 * 1024 * 1024, "Downloaded media exceeds the send cap.");
+    const sourceStat = await stat(sourcePath);
+    assert.ok(sourceStat.size > 5_000);
+    assert.ok(sourceStat.size <= 100 * 1024 * 1024);
+    const sourceProbe = JSON.parse(
+      await runCommand(
+        "ffprobe",
+        [
+          "-v",
+          "error",
+          "-show_entries",
+          "format=duration:stream=codec_type,codec_name,width,height,duration",
+          "-of",
+          "json",
+          sourcePath,
+        ],
+        30_000,
+      ),
+    );
+    const sourceVideo = sourceProbe.streams?.find((stream) => stream.codec_type === "video");
+    assert.ok(sourceVideo?.height, "Downloaded MP4 has no readable video stream.");
+
+    for (const [quality, profile] of Object.entries(QUALITY)) {
+      const outputPath = join(outputDir, `quality-${quality}.mp4`);
+      let outputStat = null;
+      let usedCrf = profile.crf;
+      for (; usedCrf <= 39; usedCrf += 4) {
+        await runCommand(
+          "ffmpeg",
+          [
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            sourcePath,
+            "-vf",
+            `scale=-2:min(${profile.ceiling}\\,ih)`,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            String(usedCrf),
+            "-c:a",
+            "aac",
+            "-b:a",
+            profile.audioBitrate,
+            "-movflags",
+            "+faststart",
+            outputPath,
+          ],
+          240_000,
+        );
+        outputStat = await stat(outputPath);
+        if (outputStat.size <= maxBytes) break;
+      }
+      assert.ok(outputStat?.size <= maxBytes, `Quality ${quality} exceeds 50 MiB.`);
+      const probe = JSON.parse(
+        await runCommand(
+          "ffprobe",
+          [
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration:stream=codec_type,width,height",
+            "-of",
+            "json",
+            outputPath,
+          ],
+          30_000,
+        ),
+      );
+      const video = probe.streams?.find((stream) => stream.codec_type === "video");
+      assert.ok(video?.height && video.height <= profile.ceiling);
+      const sourceDuration = Number(sourceProbe.format?.duration || 0);
+      const outputDuration = Number(probe.format?.duration || 0);
+      if (sourceDuration > 0 && outputDuration > 0) {
+        assert.ok(
+          Math.abs(sourceDuration - outputDuration) <= 2,
+          `Quality ${quality} output was truncated.`,
+        );
+      }
+      console.log(
+        `VIDEO_TEST_QUALITY ${quality} ${video.height}p ${outputStat.size}bytes crf=${usedCrf}`,
+      );
+    }
     console.log(
-      `VIDEO_TEST_DOWNLOAD ${JSON.stringify({ bytes: media.size, extension: files[0].split(".").pop() })}`,
+      `VIDEO_TEST_DOWNLOAD ${JSON.stringify({
+        sourceBytes: sourceStat.size,
+        sourceHeight: sourceVideo.height,
+        hasAudio: Boolean(sourceProbe.streams?.some((stream) => stream.codec_type === "audio")),
+      })}`,
     );
   } finally {
     await rm(outputDir, { recursive: true, force: true });
